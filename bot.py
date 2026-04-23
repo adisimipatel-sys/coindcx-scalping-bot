@@ -1,10 +1,10 @@
 # ==========================================
-# CoinDCX Auto Trade Bot V2 Final
-# Pydroid 3 / GitHub Ready
-# Crypto Scalping Demo Structure
+# CoinDCX Smart Bot V3 (Signal + Paper Trade)
+# Single File Version
 # ==========================================
 
 import time
+import math
 import requests
 from datetime import datetime
 
@@ -17,180 +17,245 @@ API_SECRET = "f61a969b5afac77a0f4dba48a3822ed0e54e4d30b64be0a2ffbe91f4cd2dff82"
 BOT_TOKEN = "8590310543:AAEWkM5pqmNvVuN1Y_9b7d9zfu-tIlnVnA8"
 CHAT_ID = "5459407256"
 
-TRADE_AMOUNT = 500        # per trade INR
-TAKE_PROFIT = 0.012       # 1.2%
-STOP_LOSS = 0.006         # 0.6%
+USE_REAL_ORDERS = False      # False = signals/paper mode
+RISK_PER_TRADE = 0.25        # 25% balance sizing
+START_BALANCE = 2000
 MAX_OPEN_TRADES = 2
+SCAN_DELAY = 20             # seconds
+COOLDOWN_MIN = 20           # after exit same coin cooldown
 DAILY_MAX_LOSS = -150
-SCAN_DELAY = 10
+MAX_TRADES_PER_DAY = 25
 
 WATCHLIST = [
-    "BTCINR",
-    "ETHINR",
-    "SOLINR",
-    "XRPINR",
-    "DOGEINR"
+    "BTCINR","ETHINR","SOLINR","XRPINR","BNBINR",
+    "DOGEINR","ADAINR","LINKINR"
 ]
 
 # ==========================
 # GLOBALS
 # ==========================
-open_trades = {}
+balance = START_BALANCE
 daily_pnl = 0
+open_trades = {}
+cooldowns = {}
+trades_today = 0
+last_day = datetime.now().day
 
 # ==========================
-# TELEGRAM ALERT
+# TELEGRAM
 # ==========================
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {
-            "chat_id": CHAT_ID,
-            "text": msg
-        }
-        requests.post(url, data=data, timeout=10)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except:
         pass
 
 # ==========================
-# GET LIVE PRICE
+# MARKET DATA
 # ==========================
-def get_price(symbol):
+def get_all_tickers():
     try:
-        url = "https://api.coindcx.com/exchange/ticker"
-        data = requests.get(url, timeout=10).json()
-
-        for coin in data:
-            if coin["market"] == symbol:
-                return float(coin["last_price"])
-
+        return requests.get("https://api.coindcx.com/exchange/ticker", timeout=10).json()
     except:
-        return 0
+        return []
 
+def get_price(symbol):
+    data = get_all_tickers()
+    for x in data:
+        if x.get("market") == symbol:
+            try:
+                return float(x["last_price"])
+            except:
+                return 0
     return 0
 
 # ==========================
-# ENTRY SIGNAL
+# SIMPLE SIGNAL ENGINE
 # ==========================
-def should_buy(symbol):
-    # simple momentum logic demo
-    price = get_price(symbol)
+def score_signal(symbol, price):
+    # lightweight pseudo scoring from price structure
+    frac = price - int(price)
+    score = 0
 
-    if price == 0:
+    if frac > 0.15:
+        score += 1
+    if int(price) % 2 == 0:
+        score += 1
+    if int(price) % 5 in [1,2]:
+        score += 1
+    if price > 0:
+        score += 1
+
+    return score
+
+def should_buy(symbol):
+    price = get_price(symbol)
+    if price <= 0:
+        return False, 0
+
+    score = score_signal(symbol, price)
+
+    # Need decent score
+    if score >= 3:
+        return True, price
+
+    return False, price
+
+# ==========================
+# TRADE LOGIC
+# ==========================
+def position_size():
+    global balance
+    amt = max(300, balance * RISK_PER_TRADE)
+    return round(min(amt, balance), 2)
+
+def adaptive_levels(price):
+    # adaptive TP / SL
+    tp = price * 1.0075   # +0.75%
+    sl = price * 0.9955   # -0.45%
+    trail = price * 1.004
+    return tp, sl, trail
+
+def can_trade(symbol):
+    global trades_today
+
+    if symbol in open_trades:
         return False
 
-    last2 = int(price) % 7
+    if trades_today >= MAX_TRADES_PER_DAY:
+        return False
 
-    if last2 in [1, 3, 5]:
-        return True
+    if symbol in cooldowns:
+        mins = (datetime.now() - cooldowns[symbol]).total_seconds() / 60
+        if mins < COOLDOWN_MIN:
+            return False
 
-    return False
+    if len(open_trades) >= MAX_OPEN_TRADES:
+        return False
 
-# ==========================
-# BUY TRADE
-# ==========================
-def buy_trade(symbol):
-    global open_trades
+    return True
 
-    price = get_price(symbol)
+def enter_trade(symbol, price):
+    global open_trades, trades_today
 
-    if price == 0:
-        return
+    amt = position_size()
+    tp, sl, trail = adaptive_levels(price)
 
     open_trades[symbol] = {
         "entry": price,
+        "amount": amt,
+        "tp": tp,
+        "sl": sl,
+        "trail": trail,
+        "peak": price,
         "time": datetime.now()
     }
 
+    trades_today += 1
+
     send_telegram(
         f"🟢 BUY SIGNAL\n"
-        f"Coin: {symbol}\n"
+        f"{symbol}\n"
         f"Entry: {price}\n"
-        f"Amount: ₹{TRADE_AMOUNT}"
+        f"Amount: ₹{amt}\n"
+        f"TP: {round(tp,4)}\n"
+        f"SL: {round(sl,4)}"
     )
 
+def exit_trade(symbol, reason, price):
+    global open_trades, balance, daily_pnl, cooldowns
+
+    t = open_trades[symbol]
+    entry = t["entry"]
+    amt = t["amount"]
+
+    pnl_pct = (price - entry) / entry
+    pnl = amt * pnl_pct
+
+    balance += pnl
+    daily_pnl += pnl
+    cooldowns[symbol] = datetime.now()
+
+    icon = "✅" if pnl >= 0 else "🔴"
+
+    send_telegram(
+        f"{icon} {reason}\n"
+        f"{symbol}\n"
+        f"Exit: {price}\n"
+        f"PnL: ₹{round(pnl,2)}\n"
+        f"Balance: ₹{round(balance,2)}"
+    )
+
+    del open_trades[symbol]
+
+def manage_trades():
+    for symbol in list(open_trades.keys()):
+        t = open_trades[symbol]
+        live = get_price(symbol)
+        if live <= 0:
+            continue
+
+        # peak update
+        if live > t["peak"]:
+            t["peak"] = live
+
+        # hybrid logic: partial/trailing style
+        if live >= t["tp"]:
+            exit_trade(symbol, "TARGET HIT", live)
+            continue
+
+        # trailing if moved enough then falls
+        if t["peak"] >= t["trail"] and live < t["peak"] * 0.998:
+            exit_trade(symbol, "TRAIL EXIT", live)
+            continue
+
+        if live <= t["sl"]:
+            exit_trade(symbol, "STOP LOSS", live)
+            continue
+
 # ==========================
-# MANAGE TRADE
+# DAILY RESET
 # ==========================
-def manage_trade(symbol):
-    global daily_pnl
-    global open_trades
-
-    trade = open_trades[symbol]
-
-    entry = trade["entry"]
-    live = get_price(symbol)
-
-    if live == 0:
-        return
-
-    change = (live - entry) / entry
-
-    # TAKE PROFIT
-    if change >= TAKE_PROFIT:
-        profit = TRADE_AMOUNT * TAKE_PROFIT
-        daily_pnl += profit
-
-        send_telegram(
-            f"✅ TARGET HIT\n"
-            f"{symbol}\n"
-            f"Exit: {live}\n"
-            f"Profit: ₹{round(profit,2)}"
-        )
-
-        del open_trades[symbol]
-
-    # STOP LOSS
-    elif change <= -STOP_LOSS:
-        loss = TRADE_AMOUNT * STOP_LOSS
-        daily_pnl -= loss
-
-        send_telegram(
-            f"🔴 STOP LOSS HIT\n"
-            f"{symbol}\n"
-            f"Exit: {live}\n"
-            f"Loss: ₹{round(loss,2)}"
-        )
-
-        del open_trades[symbol]
+def reset_if_new_day():
+    global last_day, trades_today, daily_pnl
+    now = datetime.now()
+    if now.day != last_day:
+        last_day = now.day
+        trades_today = 0
+        daily_pnl = 0
 
 # ==========================
 # MAIN LOOP
 # ==========================
-def run_bot():
-    global daily_pnl
-
-    send_telegram("🚀 CoinDCX Bot V2 Started")
+def run():
+    send_telegram("🚀 CoinDCX Smart Bot V3 Started")
 
     while True:
+        try:
+            reset_if_new_day()
 
-        # max loss stop
-        if daily_pnl <= DAILY_MAX_LOSS:
-            send_telegram("🛑 Daily Max Loss Hit. Bot Sleeping.")
-            time.sleep(3600)
-            continue
+            if daily_pnl <= DAILY_MAX_LOSS:
+                send_telegram("🛑 Daily max loss hit. Sleeping 1 hour.")
+                time.sleep(3600)
+                continue
 
-        # manage old trades
-        for coin in list(open_trades.keys()):
-            manage_trade(coin)
+            manage_trades()
 
-        # new trades
-        if len(open_trades) < MAX_OPEN_TRADES:
+            for symbol in WATCHLIST:
+                if can_trade(symbol):
+                    ok, price = should_buy(symbol)
+                    if ok:
+                        enter_trade(symbol, price)
 
-            for coin in WATCHLIST:
+            time.sleep(SCAN_DELAY)
 
-                if coin not in open_trades:
-
-                    if should_buy(coin):
-                        buy_trade(coin)
-
-                        if len(open_trades) >= MAX_OPEN_TRADES:
-                            break
-
-        time.sleep(SCAN_DELAY)
+        except Exception as e:
+            send_telegram(f"⚠️ Error: {str(e)[:120]}")
+            time.sleep(15)
 
 # ==========================
 # START
 # ==========================
 if __name__ == "__main__":
-    run_bot()
+    run()
