@@ -1,261 +1,297 @@
 # ==========================================
-# CoinDCX Smart Bot V3 (Signal + Paper Trade)
-# Single File Version
+# Multi-Asset Trend Rider Bot (Crypto + Forex)
+#
+#   - Crypto : CoinDCX (paper by default, real orders optional)
+#   - Forex  : signals + paper trading (execute at your own broker)
+#
+# Strategy: Triple-Confirmation Trend Rider (see strategy.py)
+# SL / TP  : set automatically per-trade from ATR volatility
+#
+# DISCLAIMER: Trading is risky. No strategy guarantees profit.
+# Always start in paper mode (USE_REAL_ORDERS=false) and test.
 # ==========================================
 
+import csv
+import hashlib
+import hmac
+import json
+import os
 import time
-import math
-import requests
 from datetime import datetime
 
-# ==========================
-# USER SETTINGS
-# ==========================
-API_KEY = "d75f901dc7edac19d582195810cb222719a1481be8cbe533"
-API_SECRET = "f61a969b5afac77a0f4dba48a3822ed0e54e4d30b64be0a2ffbe91f4cd2dff82"
+import requests
 
-BOT_TOKEN = "8590310543:AAEWkM5pqmNvVuN1Y_9b7d9zfu-tIlnVnA8"
-CHAT_ID = "5459407256"
-
-USE_REAL_ORDERS = False      # False = signals/paper mode
-RISK_PER_TRADE = 0.25        # 25% balance sizing
-START_BALANCE = 2000
-MAX_OPEN_TRADES = 2
-SCAN_DELAY = 20             # seconds
-COOLDOWN_MIN = 20           # after exit same coin cooldown
-DAILY_MAX_LOSS = -150
-MAX_TRADES_PER_DAY = 25
-
-WATCHLIST = [
-    "BTCINR","ETHINR","SOLINR","XRPINR","BNBINR",
-    "DOGEINR","ADAINR","LINKINR"
-]
+import config
+import strategy
+from datafeed import get_candles
 
 # ==========================
-# GLOBALS
+# STATE
 # ==========================
-balance = START_BALANCE
-daily_pnl = 0
-open_trades = {}
-cooldowns = {}
+balance = config.START_BALANCE
+daily_pnl = 0.0
+open_trades = {}   # symbol -> trade dict
+cooldowns = {}     # symbol -> datetime of last exit
 trades_today = 0
 last_day = datetime.now().day
+
+SYMBOLS = [(s, "crypto") for s in config.CRYPTO_WATCHLIST] + \
+          [(s, "forex") for s in config.FOREX_WATCHLIST]
+
 
 # ==========================
 # TELEGRAM
 # ==========================
 def send_telegram(msg):
+    print(msg, flush=True)
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        return
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except:
+        requests.post(
+            f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": config.TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10,
+        )
+    except requests.RequestException:
         pass
 
-# ==========================
-# MARKET DATA
-# ==========================
-def get_all_tickers():
-    try:
-        return requests.get("https://api.coindcx.com/exchange/ticker", timeout=10).json()
-    except:
-        return []
-
-def get_price(symbol):
-    data = get_all_tickers()
-    for x in data:
-        if x.get("market") == symbol:
-            try:
-                return float(x["last_price"])
-            except:
-                return 0
-    return 0
 
 # ==========================
-# SIMPLE SIGNAL ENGINE
+# TRADE JOURNAL (CSV)
 # ==========================
-def score_signal(symbol, price):
-    # lightweight pseudo scoring from price structure
-    frac = price - int(price)
-    score = 0
+def journal(row):
+    new = not os.path.exists(config.JOURNAL_FILE)
+    with open(config.JOURNAL_FILE, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow([
+                "time", "symbol", "market", "side", "event", "price",
+                "qty", "sl", "tp", "pnl", "balance", "reason",
+            ])
+        w.writerow(row)
 
-    if frac > 0.15:
-        score += 1
-    if int(price) % 2 == 0:
-        score += 1
-    if int(price) % 5 in [1,2]:
-        score += 1
-    if price > 0:
-        score += 1
-
-    return score
-
-def should_buy(symbol):
-    price = get_price(symbol)
-    if price <= 0:
-        return False, 0
-
-    score = score_signal(symbol, price)
-
-    # Need decent score
-    if score >= 3:
-        return True, price
-
-    return False, price
 
 # ==========================
-# TRADE LOGIC
+# REAL ORDERS (CoinDCX crypto only, optional)
 # ==========================
-def position_size():
-    global balance
-    amt = max(300, balance * RISK_PER_TRADE)
-    return round(min(amt, balance), 2)
+def coindcx_market_order(symbol, side, quantity):
+    body = {
+        "side": side,  # "buy" / "sell"
+        "order_type": "market_order",
+        "market": symbol,
+        "total_quantity": quantity,
+        "timestamp": int(time.time() * 1000),
+    }
+    payload = json.dumps(body, separators=(",", ":"))
+    signature = hmac.new(
+        config.COINDCX_API_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()
+    r = requests.post(
+        "https://api.coindcx.com/exchange/v1/orders/create",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": config.COINDCX_API_KEY,
+            "X-AUTH-SIGNATURE": signature,
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json()
 
-def adaptive_levels(price):
-    # adaptive TP / SL
-    tp = price * 1.0075   # +0.75%
-    sl = price * 0.9955   # -0.45%
-    trail = price * 1.004
-    return tp, sl, trail
+
+def place_order(symbol, market, side, quantity):
+    """Route order: real only for crypto when enabled; otherwise paper."""
+    if config.USE_REAL_ORDERS and market == "crypto":
+        try:
+            coindcx_market_order(symbol, side, quantity)
+            return "REAL"
+        except Exception as e:  # fall back to paper, tell the user
+            send_telegram(f"⚠️ Real order failed for {symbol}: {str(e)[:120]}\nLogged as paper trade.")
+    return "PAPER"
+
+
+# ==========================
+# RISK / SIZING
+# ==========================
+def position_qty(entry, sl):
+    """Risk RISK_PER_TRADE of balance between entry and stop."""
+    risk_amount = balance * config.RISK_PER_TRADE
+    per_unit_risk = abs(entry - sl)
+    if per_unit_risk <= 0:
+        return 0
+    qty = risk_amount / per_unit_risk
+    # never allocate more notional than 25% of balance
+    max_qty = (balance * 0.25) / entry
+    return round(min(qty, max_qty), 6)
+
 
 def can_trade(symbol):
-    global trades_today
-
     if symbol in open_trades:
         return False
-
-    if trades_today >= MAX_TRADES_PER_DAY:
+    if trades_today >= config.MAX_TRADES_PER_DAY:
         return False
-
+    if len(open_trades) >= config.MAX_OPEN_TRADES:
+        return False
     if symbol in cooldowns:
         mins = (datetime.now() - cooldowns[symbol]).total_seconds() / 60
-        if mins < COOLDOWN_MIN:
+        if mins < config.COOLDOWN_MIN:
             return False
-
-    if len(open_trades) >= MAX_OPEN_TRADES:
-        return False
-
     return True
 
-def enter_trade(symbol, price):
-    global open_trades, trades_today
 
-    amt = position_size()
-    tp, sl, trail = adaptive_levels(price)
+# ==========================
+# ENTRY / EXIT
+# ==========================
+def enter_trade(symbol, market, signal):
+    global trades_today
+
+    entry = signal["price"]
+    sl, tp = strategy.make_levels(signal["side"], entry, signal["atr"])
+    qty = position_qty(entry, sl)
+    if qty <= 0:
+        return
+
+    mode = place_order(symbol, market, "buy" if signal["side"] == "long" else "sell", qty)
 
     open_trades[symbol] = {
-        "entry": price,
-        "amount": amt,
-        "tp": tp,
+        "market": market,
+        "side": signal["side"],
+        "entry": entry,
+        "qty": qty,
         "sl": sl,
-        "trail": trail,
-        "peak": price,
-        "time": datetime.now()
+        "tp": tp,
+        "atr": signal["atr"],
+        "peak": entry,
+        "breakeven": False,
+        "mode": mode,
+        "time": datetime.now(),
     }
-
     trades_today += 1
 
+    arrow = "🟢 LONG" if signal["side"] == "long" else "🔻 SHORT"
     send_telegram(
-        f"🟢 BUY SIGNAL\n"
-        f"{symbol}\n"
-        f"Entry: {price}\n"
-        f"Amount: ₹{amt}\n"
-        f"TP: {round(tp,4)}\n"
-        f"SL: {round(sl,4)}"
+        f"{arrow} {symbol} ({market}, {mode})\n"
+        f"Entry: {entry:.6g}\n"
+        f"SL: {sl:.6g}  (auto, 1.5xATR)\n"
+        f"TP: {tp:.6g}  (auto, 3xATR, RR 1:2)\n"
+        f"Qty: {qty}\n"
+        f"Why: {signal['reason']}"
     )
+    journal([
+        datetime.now().isoformat(), symbol, market, signal["side"], "ENTRY",
+        entry, qty, round(sl, 6), round(tp, 6), "", round(balance, 2), signal["reason"],
+    ])
+
 
 def exit_trade(symbol, reason, price):
-    global open_trades, balance, daily_pnl, cooldowns
+    global balance, daily_pnl
 
-    t = open_trades[symbol]
-    entry = t["entry"]
-    amt = t["amount"]
-
-    pnl_pct = (price - entry) / entry
-    pnl = amt * pnl_pct
-
+    t = open_trades.pop(symbol)
+    direction = 1 if t["side"] == "long" else -1
+    pnl = (price - t["entry"]) * direction * t["qty"]
     balance += pnl
     daily_pnl += pnl
     cooldowns[symbol] = datetime.now()
 
+    if t["mode"] == "REAL":
+        try:
+            coindcx_market_order(symbol, "sell" if t["side"] == "long" else "buy", t["qty"])
+        except Exception as e:
+            send_telegram(f"⚠️ Real exit order failed for {symbol}: {str(e)[:120]} — CLOSE MANUALLY!")
+
     icon = "✅" if pnl >= 0 else "🔴"
-
     send_telegram(
-        f"{icon} {reason}\n"
-        f"{symbol}\n"
-        f"Exit: {price}\n"
-        f"PnL: ₹{round(pnl,2)}\n"
-        f"Balance: ₹{round(balance,2)}"
+        f"{icon} {reason} — {symbol}\n"
+        f"Exit: {price:.6g}  (entry {t['entry']:.6g})\n"
+        f"PnL: {pnl:+.2f}\n"
+        f"Balance: {balance:.2f}  |  Today: {daily_pnl:+.2f}"
     )
+    journal([
+        datetime.now().isoformat(), symbol, t["market"], t["side"], reason,
+        price, t["qty"], round(t["sl"], 6), round(t["tp"], 6),
+        round(pnl, 2), round(balance, 2), "",
+    ])
 
-    del open_trades[symbol]
 
 def manage_trades():
     for symbol in list(open_trades.keys()):
         t = open_trades[symbol]
-        live = get_price(symbol)
-        if live <= 0:
+        try:
+            candles = get_candles(symbol, t["market"], config.TIMEFRAME, 5)
+        except Exception:
             continue
-
-        # peak update
-        if live > t["peak"]:
-            t["peak"] = live
-
-        # hybrid logic: partial/trailing style
-        if live >= t["tp"]:
-            exit_trade(symbol, "TARGET HIT", live)
+        if not candles:
             continue
+        price = candles[-1]["close"]
 
-        # trailing if moved enough then falls
-        if t["peak"] >= t["trail"] and live < t["peak"] * 0.998:
-            exit_trade(symbol, "TRAIL EXIT", live)
-            continue
+        strategy.update_stop(t, price)
+        reason = strategy.check_exit(t, price)
+        if reason:
+            exit_trade(symbol, reason, price)
 
-        if live <= t["sl"]:
-            exit_trade(symbol, "STOP LOSS", live)
-            continue
 
 # ==========================
-# DAILY RESET
+# SCANNING
 # ==========================
+def scan_for_entries():
+    for symbol, market in SYMBOLS:
+        if not can_trade(symbol):
+            continue
+        try:
+            candles = get_candles(symbol, market, config.TIMEFRAME, config.CANDLE_LIMIT)
+            trend = get_candles(symbol, market, config.TREND_TIMEFRAME, config.CANDLE_LIMIT)
+        except Exception:
+            continue
+        signal = strategy.analyze(candles, trend, allow_short=(market == "forex"))
+        if signal:
+            enter_trade(symbol, market, signal)
+        time.sleep(0.5)  # be gentle with the APIs
+
+
 def reset_if_new_day():
     global last_day, trades_today, daily_pnl
     now = datetime.now()
     if now.day != last_day:
         last_day = now.day
         trades_today = 0
-        daily_pnl = 0
+        daily_pnl = 0.0
+        send_telegram(f"📅 New day. Balance: {balance:.2f}")
+
 
 # ==========================
 # MAIN LOOP
 # ==========================
 def run():
-    send_telegram("🚀 CoinDCX Smart Bot V3 Started")
+    mode = "REAL ORDERS (crypto)" if config.USE_REAL_ORDERS else "PAPER / SIGNALS"
+    send_telegram(
+        "🚀 Trend Rider Bot started\n"
+        f"Mode: {mode}\n"
+        f"Crypto: {', '.join(config.CRYPTO_WATCHLIST)}\n"
+        f"Forex: {', '.join(config.FOREX_WATCHLIST)}\n"
+        f"Risk: {config.RISK_PER_TRADE*100:.1f}%/trade | RR 1:2 | ATR SL/TP"
+    )
 
     while True:
         try:
             reset_if_new_day()
 
-            if daily_pnl <= DAILY_MAX_LOSS:
-                send_telegram("🛑 Daily max loss hit. Sleeping 1 hour.")
+            if daily_pnl <= -abs(config.START_BALANCE * config.DAILY_MAX_LOSS_PCT):
+                send_telegram("🛑 Daily max loss hit. Pausing for 1 hour.")
                 time.sleep(3600)
                 continue
 
             manage_trades()
+            scan_for_entries()
+            time.sleep(config.SCAN_DELAY)
 
-            for symbol in WATCHLIST:
-                if can_trade(symbol):
-                    ok, price = should_buy(symbol)
-                    if ok:
-                        enter_trade(symbol, price)
-
-            time.sleep(SCAN_DELAY)
-
+        except KeyboardInterrupt:
+            send_telegram("👋 Bot stopped by user.")
+            break
         except Exception as e:
-            send_telegram(f"⚠️ Error: {str(e)[:120]}")
-            time.sleep(15)
+            send_telegram(f"⚠️ Error: {str(e)[:150]}")
+            time.sleep(30)
 
-# ==========================
-# START
-# ==========================
+
 if __name__ == "__main__":
     run()
