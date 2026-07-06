@@ -38,6 +38,9 @@ last_day = datetime.now().day
 SYMBOLS = [(s, "crypto") for s in config.CRYPTO_WATCHLIST] + \
           [(s, "forex") for s in config.FOREX_WATCHLIST]
 
+ANALYZE_FN, STRAT_PARAMS = strategy.get_strategy()
+TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "1d": 1440}
+
 
 # ==========================
 # TELEGRAM
@@ -147,7 +150,8 @@ def enter_trade(symbol, market, signal):
     global trades_today
 
     entry = signal["price"]
-    sl, tp = strategy.make_levels(signal["side"], entry, signal["atr"])
+    sl, tp = strategy.make_levels(signal["side"], entry, signal["atr"],
+                                  STRAT_PARAMS.get("sl"), STRAT_PARAMS.get("tp"))
     qty = position_qty(entry, sl)
     if qty <= 0:
         return
@@ -164,6 +168,8 @@ def enter_trade(symbol, market, signal):
         "atr": signal["atr"],
         "peak": entry,
         "breakeven": False,
+        "trail_mult": STRAT_PARAMS.get("trail"),
+        "be_atr": STRAT_PARAMS.get("be"),
         "mode": mode,
         "time": datetime.now(),
     }
@@ -173,8 +179,8 @@ def enter_trade(symbol, market, signal):
     send_telegram(
         f"{arrow} {symbol} ({market}, {mode})\n"
         f"Entry: {entry:.6g}\n"
-        f"SL: {sl:.6g}  (auto, 1.5xATR)\n"
-        f"TP: {tp:.6g}  (auto, 3xATR, RR 1:2)\n"
+        f"SL: {sl:.6g}  (auto, ATR-based)\n"
+        f"TP: {tp:.6g}  (auto, ATR-based)\n"
         f"Qty: {qty}\n"
         f"Why: {signal['reason']}"
     )
@@ -215,10 +221,12 @@ def exit_trade(symbol, reason, price):
 
 
 def manage_trades():
+    exit_fn = STRAT_PARAMS.get("exit_fn")
     for symbol in list(open_trades.keys()):
         t = open_trades[symbol]
         try:
-            candles = get_candles(symbol, t["market"], config.TIMEFRAME, 5)
+            candles = get_candles(symbol, t["market"], config.TIMEFRAME,
+                                  60 if exit_fn else 5)
         except Exception:
             continue
         if not candles:
@@ -227,6 +235,10 @@ def manage_trades():
 
         strategy.update_stop(t, price)
         reason = strategy.check_exit(t, price)
+        if not reason and exit_fn:
+            tf_min = TF_MINUTES.get(config.TIMEFRAME, 5)
+            bars_held = (datetime.now() - t["time"]).total_seconds() / (tf_min * 60)
+            reason = exit_fn(t, candles, bars_held)
         if reason:
             exit_trade(symbol, reason, price)
 
@@ -243,7 +255,7 @@ def scan_for_entries():
             trend = get_candles(symbol, market, config.TREND_TIMEFRAME, config.CANDLE_LIMIT)
         except Exception:
             continue
-        signal = strategy.analyze(candles, trend, allow_short=(market == "forex"))
+        signal = ANALYZE_FN(candles, trend, allow_short=(market == "forex"))
         if signal:
             enter_trade(symbol, market, signal)
         time.sleep(0.5)  # be gentle with the APIs
@@ -269,7 +281,8 @@ def run():
         f"Mode: {mode}\n"
         f"Crypto: {', '.join(config.CRYPTO_WATCHLIST)}\n"
         f"Forex: {', '.join(config.FOREX_WATCHLIST)}\n"
-        f"Risk: {config.RISK_PER_TRADE*100:.1f}%/trade | RR 1:2 | ATR SL/TP"
+        f"Strategy: {config.STRATEGY}\n"
+        f"Risk: {config.RISK_PER_TRADE*100:.1f}%/trade | ATR-based SL/TP"
     )
 
     while True:

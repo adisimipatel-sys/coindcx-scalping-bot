@@ -45,8 +45,16 @@ def resample(candles, factor):
 
 
 def run_backtest(name, candles, allow_short, fee_pct, start_balance=None,
-                 trend_factor=TREND_FACTOR):
-    """Walk-forward simulation. fee_pct = per-side cost (e.g. 0.002 = 0.2%)."""
+                 trend_factor=TREND_FACTOR, analyze_fn=None, params=None,
+                 quiet=False):
+    """Walk-forward simulation. fee_pct = per-side cost (e.g. 0.002 = 0.2%).
+
+    analyze_fn : signal function (default: the live bot's strategy.analyze)
+    params     : optional dict {sl, tp, trail, be} of ATR multipliers;
+                 trail/be = None disables trailing for this run
+    """
+    analyze_fn = analyze_fn or strategy.analyze
+    exit_fn = params.get("exit_fn") if params else None
     balance = start_balance if start_balance is not None else config.START_BALANCE
     equity_curve = [balance]
     trades = []
@@ -76,6 +84,12 @@ def run_backtest(name, candles, allow_short, fee_pct, start_balance=None,
             elif hit_tp:
                 exit_price, reason = p["tp"], "TARGET HIT"
 
+            if exit_price is None and exit_fn:
+                # strategy-specific exit (e.g. "exit on strength"), at bar close
+                r2 = exit_fn(p, candles[max(0, i - 59):i + 1], i - p["bar"])
+                if r2:
+                    exit_price, reason = bar["close"], r2
+
             if exit_price is not None:
                 direction = 1 if p["side"] == "long" else -1
                 gross = (exit_price - p["entry"]) * direction * p["qty"]
@@ -97,10 +111,13 @@ def run_backtest(name, candles, allow_short, fee_pct, start_balance=None,
         if position is None and i > cooldown_until:
             window = candles[max(0, i - ENTRY_WINDOW + 1):i + 1]
             trend = resample(candles[:i + 1], trend_factor)[-260:]
-            sig = strategy.analyze(window, trend, allow_short=allow_short)
+            sig = analyze_fn(window, trend, allow_short=allow_short)
             if sig:
                 entry = sig["price"]
-                sl, tp = strategy.make_levels(sig["side"], entry, sig["atr"])
+                sl_mult = params.get("sl") if params else None
+                tp_mult = params.get("tp") if params else None
+                sl, tp = strategy.make_levels(sig["side"], entry, sig["atr"],
+                                              sl_mult, tp_mult)
                 risk_amount = balance * config.RISK_PER_TRADE
                 per_unit = abs(entry - sl)
                 if per_unit > 0:
@@ -110,6 +127,9 @@ def run_backtest(name, candles, allow_short, fee_pct, start_balance=None,
                         "sl": sl, "tp": tp, "atr": sig["atr"], "peak": entry,
                         "breakeven": False, "risk": qty * per_unit, "bar": i,
                     }
+                    if params:
+                        position["trail_mult"] = params.get("trail")
+                        position["be_atr"] = params.get("be")
 
         equity_curve.append(balance)
 
@@ -126,10 +146,10 @@ def run_backtest(name, candles, allow_short, fee_pct, start_balance=None,
                        "reason": "END OF DATA", "bars": len(candles) - 1 - p["bar"]})
         equity_curve.append(balance)
 
-    return report(name, trades, equity_curve, candles, warmup)
+    return report(name, trades, equity_curve, candles, warmup, quiet=quiet)
 
 
-def report(name, trades, equity, candles, warmup):
+def report(name, trades, equity, candles, warmup, quiet=False):
     start = equity[0]
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
@@ -155,6 +175,9 @@ def report(name, trades, equity, candles, warmup):
         "buy_hold_pct": 100 * bh,
         "final_balance": equity[-1],
     }
+
+    if quiet:
+        return stats
 
     print(f"\n===== {name} =====")
     print(f"Bars tested      : {stats['bars_tested']}")

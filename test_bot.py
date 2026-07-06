@@ -128,9 +128,30 @@ def test_paper_trade_flow():
     print(f"✅ paper trade flow OK (balance 2000 -> {bot.balance:.2f})")
 
 
+def test_strategy_variants():
+    import strategy as st
+    for name, (fn, params) in st.VARIANTS.items():
+        assert callable(fn) and "sl" in params and "tp" in params, name
+    fn, p = st.get_strategy("rsi2_dip")
+    # uptrend + 3 sharp down closes -> RSI(2) pinned low -> long signal
+    closes = [100.0 + 0.2 * i for i in range(300)]
+    closes += [closes[-1] - 1.0, closes[-1] - 2.0, closes[-1] - 3.0]
+    candles = make_candles(closes)
+    trend = make_candles([50.0 + 0.5 * i for i in range(210)])
+    sig = fn(candles, trend, allow_short=False)
+    assert sig and sig["side"] == "long", "rsi2_dip should buy the deep dip"
+    try:
+        st.get_strategy("no_such_strategy")
+        raise AssertionError("unknown strategy must raise")
+    except ValueError:
+        pass
+    print("✅ strategy variants OK")
+
+
 if __name__ == "__main__":
     test_indicators()
     test_strategy_signal()
     test_levels_and_exits()
     test_paper_trade_flow()
+    test_strategy_variants()
     print("\n🎉 All tests passed")

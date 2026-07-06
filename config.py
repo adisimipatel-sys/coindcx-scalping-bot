@@ -64,6 +64,12 @@ FOREX_WATCHLIST = [
     if s.strip()
 ]
 
+# --- Strategy selection ---
+# Options: trend_rider (default, best overall expectancy in backtests),
+#          trend_rr1, rsi2_dip (highest win rate), rsi2_connors, rsi2_tight,
+#          ema_pullback, bb_reversion — compare them with strategy_lab.py
+STRATEGY = _env("STRATEGY", "trend_rider")
+
 # --- Strategy timeframe ---
 TIMEFRAME = _env("TIMEFRAME", "5m")          # entry timeframe
 TREND_TIMEFRAME = _env("TREND_TIMEFRAME", "1h")  # higher-timeframe trend filter

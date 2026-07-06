@@ -42,6 +42,21 @@ A trade is taken only when **all three** confirmations agree:
 - Daily loss cap 3% — bot pauses automatically
 - 30-minute cooldown per symbol after an exit
 
+## Choosing a strategy
+
+Seven strategies are built in — set `STRATEGY` in `.env`:
+
+| Strategy | Style | Backtest character |
+|---|---|---|
+| `trend_rider` (default) | trend-following, RR 1:2 + trailing | best overall expectancy, WR ~35-40% |
+| `trend_rr1` | same entries, RR 1:1 | higher WR (~50-70%), smaller edge |
+| `rsi2_dip` | Connors RSI(2) mean reversion | highest WR (65-88%) but regime-dependent |
+| `rsi2_connors` / `rsi2_tight` | RSI(2) variants | middle ground |
+| `ema_pullback` / `bb_reversion` | dip-buying | underperformed in tests |
+
+Compare them yourself on real data: `pip install backtesting && python strategy_lab.py`.
+Full numbers in [BACKTEST_RESULTS.md](BACKTEST_RESULTS.md).
+
 ## Setup
 
 ```bash
@@ -58,7 +73,8 @@ in `.env`.
 | File | Purpose |
 |------|---------|
 | `bot.py` | Main loop: scanning, entries/exits, Telegram, journal |
-| `strategy.py` | Signal engine + automatic SL/TP/trailing logic |
+| `strategy.py` | Signal engines (7 selectable strategies) + automatic SL/TP/trailing |
+| `strategy_lab.py` | Compare all strategies on real data with train/validation split |
 | `indicators.py` | EMA, RSI, MACD, ATR (pure Python) |
 | `datafeed.py` | CoinDCX + Yahoo Finance candle feeds |
 | `config.py` | All settings, loaded from `.env` |
